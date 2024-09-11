@@ -1,0 +1,328 @@
+---
+title: "dssat_sim"
+author: "Luiz Felipe Almeida"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# Load packages
+
+```{r}
+library(apsimx)
+library(tidyverse)
+library(DSSAT)
+library(tidyr)
+library(readr)
+library(readxl)
+library(lubridate)
+```
+
+# Generate .WTH file
+
+```{r}
+# Calculate the weather station information, including latitude, longitude, state, and weather codes
+station_info <- WeatherMesonet %>%
+  dplyr::select(ID, X, Y) %>%
+  group_by(ID) %>%
+  summarise(
+    Latitude = round(mean(Y), 3),
+    Longitude = round(mean(X), 3)
+  ) %>%
+  mutate(
+    State = case_when(
+      str_detect(ID, "^IA") ~ "Iowa",
+      str_detect(ID, "^IN") ~ "Indi",
+      str_detect(ID, "^KS") ~ "Kans",
+      str_detect(ID, "^NC") ~ "Noca",
+      str_detect(ID, "^ND") ~ "Noda",
+      str_detect(ID, "^OH") ~ "Ohio",
+      str_detect(ID, "^SD") ~ "Soda",
+      str_detect(ID, "^AR") ~ "Arka",
+      str_detect(ID, "^MN") ~ "Minn",
+      str_detect(ID, "^WI") ~ "Wisc",
+      TRUE ~ NA_character_
+    ),
+    StationCode = paste0(substr(ID, 1, 3), str_extract(ID, "\\d$")),
+    WeatherCode = paste0(State, substr(ID, 7, 8), "0", substr(ID, 3, 3))
+  ) %>%
+  ungroup() 
+```
+
+```{r}
+# Prepare the weather data with formatted dates and placeholders for missing data
+weather_data <- WeatherMesonet_processed %>%
+  mutate(
+    DateFormatted = format(DATE, format = "%Y%j"),
+    DEWP = -99.0, 
+    WIND = -99, 
+    PAR = -99.0, 
+    EVAP = -99.0, 
+    RHUM = -99.0
+  ) %>%
+  dplyr::select(DateFormatted, TMIN, TMAX, RAIN, SRAD, DEWP, WIND, PAR, EVAP, RHUM, ID)
+```
+
+```{r}
+# Calculate average temperature across and temperature amplitude for each station
+temp_info <- WeatherMesonet_processed %>%
+  group_by(ID) %>%
+  summarise(
+    AvgTemp = mean((TMIN + TMAX) / 2, na.rm = TRUE),
+    TempAmp = max(TMAX, na.rm = TRUE) - min(TMIN, na.rm = TRUE),
+    .groups = 'drop' # Ungroup the data after summarise
+  )
+```
+
+```{r}
+# Format each weather data row for the output
+formatted_weather <- weather_data %>%
+  mutate(
+    DateFormatted = sprintf("%7s", DateFormatted),
+    TMIN = sprintf("%6.1f", TMIN),
+    TMAX = sprintf("%6.1f", TMAX),
+    RAIN = sprintf("%6.1f", RAIN),
+    SRAD = sprintf("%6.1f", SRAD),
+    DEWP = sprintf("%6.1f", DEWP),
+    WIND = sprintf("%6d", WIND),
+    PAR  = sprintf("%6.1f", PAR),
+    EVAP = sprintf("%6.1f", EVAP),
+    RHUM = sprintf("%6.1f", RHUM)
+  ) %>%
+  unite("DataRow", DateFormatted, TMIN, TMAX, RAIN, SRAD, DEWP, WIND, PAR, EVAP, RHUM, sep = "") %>%
+  split(.$ID)
+```
+
+```{r}
+# Write out a weather file for each station ID
+unique_ids <- unique(station_info$ID)
+
+for (id in unique_ids) {
+  # Create the header lines for the weather data file of the current ID
+  weather_header <- c(
+    # Use sprintf to insert the weather station name into the header, %s is a placeholder for string
+    sprintf("$WEATHER: %s", station_info$WeatherCode[station_info$ID == id]),
+    # An empty string to create a blank line for formatting purposes
+    "",
+    # Header line for column names
+    "@ INSI      LAT     LONG  ELEV   TAV   AMP REFHT WNDHT",
+    # Use sprintf to format and insert variables into the metadata line
+    sprintf(
+      "  %s  %7.3f  %7.3f   %3d  %4.1f  %4.1f   2.0   2.0", 
+      station_info$StationCode[station_info$ID == id],
+      station_info$Latitude[station_info$ID == id],
+      station_info$Longitude[station_info$ID == id],
+      150, # Assumed constant elevation
+      temp_info$AvgTemp[temp_info$ID == id],
+      temp_info$TempAmp[temp_info$ID == id]
+    ),
+    # Another header line for column names
+    "@  DATE  TMIN  TMAX  RAIN  SRAD  DEWP  WIND   PAR  EVAP  RHUM"
+  )
+  
+  # Construct the filename
+  file_name <- paste0("dssat/wth/",
+                      station_info$StationCode[station_info$ID == id], 
+                      substr(station_info$ID[station_info$ID == id], 7, 8), 
+                      "01.WTH")
+  
+  # Open file connection
+  file_conn <- file(file_name, open = "w")
+  
+  # Write the header to the file
+  writeLines(weather_header, file_conn)
+
+  # Ensure the data is a character vector by extracting the 'DataRow' column
+  if ("DataRow" %in% names(formatted_weather[[id]])) {
+    writeLines(formatted_weather[[id]]$DataRow, file_conn)
+  } else {
+    stop(paste("No DataRow column found for ID:", id))
+  }
+  
+  # Close the file connection
+  close(file_conn)
+}
+```
+
+
+# Generate .SBX file
+
+```{r}
+# Sowing date
+sbx.sowing <- Sowing %>% 
+  mutate(year = substr(ID, 5, 8),
+         Sowing = dmy(paste0(SowFixedDate,"-",year)),
+         Sowing = format(Sowing, format = "%y%j")) %>%
+  mutate(START_SIM = dmy(paste0("01-01-", year)),
+         START_SIM = format(START_SIM, format = "%y%j")) %>% 
+  dplyr::select(ID, Sowing, START_SIM)
+
+# !IB00000001 DEEP SILTY CLAY
+# !IB00000004 DEEP SILTY LOAM
+# !IB00000007 DEEP SANDY LOAM
+
+# Soil type
+sbx.soil <- data.frame(SoilType = c("IB00000001", "IB00000004", "IB00000007"))
+
+sbx.genericMG <- 
+  data.frame(INGENO = as.integer(c(990011, 990012, 990013,
+                                     990001, 990002, 990003,
+                                     990004, 990005, 990006, 
+                                     990007, 990008, 990009,
+                                     990010))) %>% 
+  mutate(
+    MG = case_when(
+      INGENO == 990011 ~ "000",
+      INGENO == 990012 ~ "00",
+      INGENO == 990013 ~ "0",
+      INGENO == 990001 ~ "1",
+      INGENO == 990002 ~ "2",
+      INGENO == 990003 ~ "3",
+      INGENO == 990004 ~ "4",
+      INGENO == 990005 ~ "5",
+      INGENO == 990006 ~ "6",
+      INGENO == 990007 ~ "7",
+      INGENO == 990008 ~ "8",
+      INGENO == 990009 ~ "9",
+      INGENO == 990010 ~ "10"))
+
+# MG
+sbx.genotype <- Genotype %>% 
+  summarise(ID, MG = substr(CultivarName, 11, 11)) %>% 
+  left_join(sbx.genericMG, by = "MG") %>% 
+  dplyr::select(-MG)
+
+```
+
+
+```{r}
+# Load the general setup
+filex <- read_filex("dssat/sbx/general.SBX")
+
+# Assuming that 'sbx.sowing', 'sbx.genotype', 'sbx.soil', and 'station_info' are properly set up
+unique_ids <- unique(station_info$ID)
+
+for (id in unique_ids) {
+  # Extract INGENO for the current ID
+  ingeno <- sbx.genotype %>%
+    filter(ID == id) %>%
+    pull(INGENO) %>%
+    as.integer()
+
+  # Extract the weather station code for the current ID
+  wsta <- station_info %>%
+    filter(ID == id) %>%
+    pull(StationCode) %>%
+    as.character()
+
+  # Soil types - Example using the first type
+  soil_type <- sbx.soil$SoilType[1]  # Change index if needed for different soil types
+
+  # Planting and simulation dates from sowing data
+  sowing_date <- sbx.sowing %>%
+    filter(ID == id) %>%
+    pull(Sowing) %>%
+    as.integer()
+
+  start_sim_date <- sbx.sowing %>%
+    filter(ID == id) %>%
+    pull(START_SIM) %>%
+    as.integer()
+
+  # Set the extracted values into the filex structure
+  filex$`TREATMENTS                        -------------FACTOR LEVELS------------`$TNAME <- as.character(id)
+  filex$CULTIVARS$INGENO <- ingeno
+  filex$FIELDS$WSTA <- wsta
+  filex$FIELDS$ID_SOIL <- soil_type
+  filex$`PLANTING DETAILS`$PDATE <- sowing_date
+  filex$`SIMULATION CONTROLS`$SDATE <- start_sim_date
+
+  # Setting up NA values for specific sections
+  filex$`PLANTING DETAILS`$EDATE <- NA
+  filex$`INITIAL CONDITIONS`$ICDAT <- NA
+  filex$`IRRIGATION AND WATER MANAGEMENT`$IDATE[[1]] <- rep(NA, 6)
+  filex$`SIMULATION CONTROLS`$PFRST <- NA
+  filex$`SIMULATION CONTROLS`$PLAST <- NA
+  filex$`SIMULATION CONTROLS`$HLAST <- NA
+  filex$`SIMULATION CONTROLS`$HFRST <- NA
+  
+  # Format SNO3 values with 2 decimals before assigning
+  SNO3_VAL <- sprintf("%.2f", c(12.0, 12.0, 12.0, 7.00, 4.00, 1.00, 1.00, 0.50, 0.50))
+  filex$`INITIAL CONDITIONS`$SNO3[[1]] <- SNO3_VAL
+
+  # Construct the filename for the output
+  weather_code <- station_info %>%
+    filter(ID == id) %>%
+    pull(WeatherCode) %>%
+    as.character()
+
+  file_name <- paste0("dssat/sbx/", weather_code, ".SBX")
+
+  # Write the file
+  write_filex(filex = filex, file_name = file_name)
+}
+```
+
+# DSSAT in R
+
+```{r}
+setwd("C:/DSSAT48/Soybean/")
+options(DSSAT.CSM = 'C:\\DSSAT48\\DSCSM048.EXE')
+dssat_phenology <- data.frame()
+
+for(i in 1:length(alm)){
+  
+  # Run DSSAT from dssat package #
+  DSSAT::write_dssbatch(x = alm[[i]],
+                        trtno = 1, rp = 1, sq = 0, op = 1, co = 0,
+                        file_name = "C:/DSSAT48/Soybean/DSSBatch.v48")
+
+  # DSSBatch <- sort(list.files(path = "C:/DSSAT48/Soybean/", full.names = FALSE,
+  #                           pattern = ".v48"), decreasing = FALSE)
+  # 
+  # pathcom <- rep("C:/DSSAT48/DSCSM048.EXE CRGRO048 B ", times = length(DSSBatch))
+  # comstring <- paste(pathcom, DSSBatch, sep = "")
+  # 
+  # # Write the list of command lines to run into the system (solo cambio de formato):
+  # comstring <- matrix(comstring, ncol = 1, byrow = TRUE)
+  
+  DSSAT::run_dssat(run_mode = 'B', file_name = "C:/DSSAT48/Soybean/DSSBatch.v48")
+
+  # ### Run dssat with a classic approach ####
+  # for(j in comstring) {system(j, intern = FALSE, wait = TRUE)} # Call to run CSM within R
+
+  file_content <- read_lines("C:/DSSAT48/Soybean/OVERVIEW.OUT")
+  
+  # Read overview
+  start_line <- which(grepl("  0 Start Sim ", file_content))
+  end_line <- which(grepl("\\*MAIN GROWTH AND DEVELOPMENT VARIABLES", file_content)) - 3
+  
+  data_section <- file_content[start_line:end_line]
+  temp_file_path <- tempfile()
+  write_lines(data_section, temp_file_path)
+  
+  col_positions <- fwf_positions(start = c(2, 10, 14, 27, 35, 41, 47, 52, 57, 63, 69, 75, 84),
+                                 end = c(8, 13, 24, 32, 39, 45, 50, 55, 61, 67, 73, 79, 85),
+                                 col_names = c("DATE", "CROP_AGE", "GROWTH_STAGE", 
+                                               "BIOMASS_kg_ha", "LAI", "LEAF_NUM", 
+                                               "CROP_N_kg_ha", "CROP_N_perc", 
+                                               "STRESS_H2O", "STRESS_Nitr", 
+                                               "STRESS_Phos1", "STRESS_Phos2", 
+                                               "RSTG"))
+  
+  dssat_phenology_temp <- read_fwf(temp_file_path, col_positions)
+   
+  # Obtain site_year and simulation_type from filename
+  filename <- basename(alm[[i]])
+  site_year <- substr(filename, 1, 8)
+  simulation_type <- substr(read_output("C:/DSSAT48/Soybean/SUMMARY.OUT")$SOIL_ID, 9, 10)
+   
+  # Add ID cols
+  dssat_phenology_temp <- dssat_phenology_temp %>%
+    mutate(Site = site_year, SOIL_TYPE = simulation_type)
+
+  dssat_phenology <- rbind(dssat_phenology, dssat_phenology_temp)
+}
+
+```
+
+
